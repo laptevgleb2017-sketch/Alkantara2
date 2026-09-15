@@ -5,6 +5,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 import os
 
+
 class AssetManager:
     def __init__(self, root):
         self.root = root
@@ -18,7 +19,8 @@ class AssetManager:
         self.excel_path = os.path.join(self.data_dir, 'assets.xlsx')
 
         self.assets = []
-        self.tree_items = {}   # item_id -> asset dict
+        self.tree_items = {}      # item_id -> asset dict
+        self.filter_combos = {}   # имя фильтра -> Combobox
 
         if not os.path.exists(self.excel_path):
             self.create_excel_file()
@@ -49,7 +51,7 @@ class AssetManager:
             ws = wb.active
             self.assets = []
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row and row[4]:  # если есть наименование
+                if row and row[4]:
                     asset = {
                         'account':      str(row[0] or ''),
                         'responsible':  str(row[1] or ''),
@@ -140,14 +142,18 @@ class AssetManager:
         e.pack(side=tk.LEFT, padx=5)
         e.bind('<KeyRelease>', lambda ev: self.refresh())
 
-        for label, var in [("Счет:", self.f_account),
-                           ("Ответственный:", self.f_resp),
-                           ("Место хранения:", self.f_loc)]:
+        # Явно привязываем комбобоксы к именам фильтров
+        filter_defs = [
+            ("Счет:",           self.f_account, 'account'),
+            ("Ответственный:",  self.f_resp,    'responsible'),
+            ("Место хранения:", self.f_loc,     'location'),
+        ]
+        for label, var, key in filter_defs:
             tk.Label(inner, text=label, bg='#ffffff').pack(side=tk.LEFT, padx=(15, 3))
             cb = ttk.Combobox(inner, textvariable=var, width=22, state='readonly')
             cb.pack(side=tk.LEFT)
             cb.bind('<<ComboboxSelected>>', lambda ev: self.refresh())
-            setattr(self, 'cb_' + var._name, cb)
+            self.filter_combos[key] = cb
 
         tk.Button(inner, text="✖ Сброс", command=self.reset_filters,
                   bg='#9E9E9E', fg='white', relief=tk.FLAT,
@@ -223,16 +229,16 @@ class AssetManager:
         return out
 
     def update_filter_values(self):
-        for var, cb, field in [
-            (self.f_account, self.cb_f_account, 'account'),
-            (self.f_resp,    self.cb_f_resp,    'responsible'),
-            (self.f_loc,     self.cb_f_loc,     'location'),
-        ]:
+        for key, field in [('account', 'account'),
+                           ('responsible', 'responsible'),
+                           ('location', 'location')]:
             values = sorted({a[field] for a in self.assets if a[field]})
-            current = var.get()
-            cb['values'] = [''] + values
-            if current not in values:
-                var.set('')
+            cb = self.filter_combos.get(key)
+            if cb is not None:
+                current = cb.get()
+                cb['values'] = [''] + values
+                if current not in values:
+                    cb.set('')
 
     def refresh(self):
         self.update_filter_values()
@@ -355,15 +361,15 @@ class AssetManager:
                 if row and any(row):
                     if len(row) >= 10 and row[4]:
                         asset = {
-                            'account': str(row[0] or ''),
-                            'responsible': str(row[1] or ''),
-                            'location': str(row[2] or ''),
-                            'num': len(self.assets) + 1,
-                            'name': str(row[4] or ''),
-                            'inventory': str(row[5] or ''),
-                            'date': str(row[6] or ''),
-                            'cost': float(row[7]) if isinstance(row[7], (int, float)) else 0.0,
-                            'quantity': int(row[8]) if isinstance(row[8], (int, float)) else 1,
+                            'account':      str(row[0] or ''),
+                            'responsible':  str(row[1] or ''),
+                            'location':     str(row[2] or ''),
+                            'num':          len(self.assets) + 1,
+                            'name':         str(row[4] or ''),
+                            'inventory':    str(row[5] or ''),
+                            'date':         str(row[6] or ''),
+                            'cost':         float(row[7]) if isinstance(row[7], (int, float)) else 0.0,
+                            'quantity':     int(row[8]) if isinstance(row[8], (int, float)) else 1,
                             'depreciation': float(row[9]) if isinstance(row[9], (int, float)) else 0.0,
                         }
                         asset['residual'] = asset['cost'] - asset['depreciation']

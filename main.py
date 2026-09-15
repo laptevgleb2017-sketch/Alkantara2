@@ -9,6 +9,12 @@ import shutil
 from datetime import datetime
 
 try:
+    import xlrd
+    HAS_XLRD = True
+except ImportError:
+    HAS_XLRD = False
+
+try:
     import matplotlib
     matplotlib.use('TkAgg')
     import matplotlib.pyplot as plt
@@ -16,6 +22,14 @@ try:
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
+
+
+# Русские названия полей для массового редактирования
+FIELD_LABELS = {
+    'Счёт':           'account',
+    'Ответственный':  'responsible',
+    'Место хранения': 'location',
+}
 
 
 class AssetManager:
@@ -218,27 +232,64 @@ class AssetManager:
                 return 'report'
         return 'flat'
 
+    def _ask_sheet(self, names):
+        if not names:
+            return None
+        if len(names) == 1:
+            return names[0]
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Выбор листа")
+        dlg.geometry("340x180")
+        dlg.grab_set()
+        tk.Label(dlg, text="В файле несколько листов.\nВыберите нужный:",
+                 font=('Segoe UI', 10)).pack(pady=10)
+        var = tk.StringVar(value=names[0])
+        ttk.Combobox(dlg, textvariable=var, values=names,
+                     state='readonly', width=35).pack(pady=5)
+        result = {'ok': False, 'value': None}
+
+        def ok():
+            result['ok'] = True
+            result['value'] = var.get()
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Открыть", command=ok).pack(pady=10)
+        dlg.bind('<Return>', lambda e: ok())
+        self.root.wait_window(dlg)
+        return result['value'] if result['ok'] else None
+
     def open_file(self):
         path = filedialog.askopenfilename(
             title="Открыть ведомость",
             initialdir=self.app_dir,
-            filetypes=[("Excel", "*.xlsx"), ("Все файлы", "*.*")])
+            filetypes=[("Excel", "*.xlsx *.xls"),
+                       ("Современный Excel", "*.xlsx"),
+                       ("Старый Excel", "*.xls"),
+                       ("Все файлы", "*.*")])
         if not path:
             return
         self.load_file(path)
         self.refresh()
 
-    def load_file(self, path):
+    def load_file(self, path, sheet_name=None):
+        ext = os.path.splitext(path)[1].lower()
         try:
-            wb = openpyxl.load_workbook(path, data_only=True)
-            ws = wb.active
-            fmt = self.detect_format(ws)
-            if fmt == 'flat':
-                self._load_flat(ws)
-                self.is_report_format = False
+            if ext == '.xls':
+                self._load_xls(path, sheet_name)
             else:
-                self._load_report(ws)
-                self.is_report_format = True
+                wb = openpyxl.load_workbook(path, data_only=True)
+                if sheet_name is None and len(wb.sheetnames) > 1:
+                    sheet_name = self._ask_sheet(wb.sheetnames)
+                    if sheet_name is None:
+                        return
+                ws = wb[sheet_name] if sheet_name else wb.active
+                fmt = self.detect_format(ws)
+                if fmt == 'flat':
+                    self._load_flat(ws)
+                    self.is_report_format = False
+                else:
+                    self._load_report(ws)
+                    self.is_report_format = True
             self.current_file = path
             self.save_settings()
             self.update_title()
@@ -246,6 +297,29 @@ class AssetManager:
             self.update_dict_from_assets()
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось открыть файл: {e}")
+
+    def _load_xls(self, path, sheet_name=None):
+        if not HAS_XLRD:
+            messagebox.showerror("Ошибка",
+                "Для чтения файлов .xls установите библиотеку xlrd.\n"
+                "В командной строке выполните:\npip install xlrd==2.0.1")
+            return
+        book = xlrd.open_workbook(path)
+        names = book.sheet_names()
+        if sheet_name is None:
+            sheet_name = self._ask_sheet(names)
+            if sheet_name is None:
+                return
+        sheet = book.sheet_by_name(sheet_name)
+        self.assets = []
+        for r in range(1, sheet.nrows):
+            row = [sheet.cell_value(r, c) for c in range(sheet.ncols)]
+            if not row or len(row) < 5 or not row[4]:
+                continue
+            a = self._row_to_asset(row)
+            if a:
+                self.assets.append(a)
+        self.is_report_format = False
 
     def update_title(self):
         name = os.path.basename(self.current_file) if self.current_file else 'без файла'
@@ -265,12 +339,18 @@ class AssetManager:
             def s(i):
                 return str(row[i]).strip() if i < len(row) and row[i] is not None else ''
             def f(i):
-                return float(row[i]) if i < len(row) and isinstance(row[i], (int, float)) else 0.0
+                try:
+                    return float(row[i]) if i < len(row) and row[i] not in (None, '') else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
             def n(i):
-                return int(row[i]) if i < len(row) and isinstance(row[i], (int, float)) else 1
+                try:
+                    return int(float(row[i])) if i < len(row) and row[i] not in (None, '') else 1
+                except (TypeError, ValueError):
+                    return 1
             return {
                 'account': s(0), 'responsible': s(1), 'location': s(2),
-                'num': int(row[3]) if isinstance(row[3], (int, float)) else len(self.assets) + 1,
+                'num': n(3) if n(3) else len(self.assets) + 1,
                 'name': s(4), 'inventory': s(5), 'date': s(6),
                 'cost': f(7), 'quantity': n(8), 'depreciation': f(9),
                 'disposal_date': s(10), 'disposal_reason': s(11),
@@ -328,6 +408,11 @@ class AssetManager:
     def save_file(self):
         if not self.current_file:
             return self.save_file_as()
+        if self.current_file.lower().endswith('.xls'):
+            messagebox.showwarning("Внимание",
+                "Формат .xls не поддерживает запись.\n"
+                "Нажмите «Сохранить как» и выберите формат .xlsx.")
+            return self.save_file_as()
         try:
             self.create_backup()
             if self.is_report_format:
@@ -347,7 +432,7 @@ class AssetManager:
     def save_file_as(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".xlsx", initialdir=self.app_dir,
-            filetypes=[("Excel", "*.xlsx")])
+            filetypes=[("Excel 2007+", "*.xlsx"), ("Все файлы", "*.*")])
         if not path:
             return False
         self.current_file = path
@@ -619,23 +704,34 @@ class AssetManager:
         self.root.bind('<F5>', lambda e: self.refresh())
 
     def apply_theme(self):
+        # Размер шрифта для групп: базовый 9 + 4 = 13
+        GRP_FONT_SIZE = 13
         if self.dark_mode:
             bg = '#2b2b2b'; panel = '#3c3c3c'
-            self.tree.tag_configure('group1', background='#1e3a5f', foreground='#ffffff')
-            self.tree.tag_configure('group2', background='#2a4a2a', foreground='#ffffff')
-            self.tree.tag_configure('group3', background='#5f4a1e', foreground='#ffffff')
+            self.tree.tag_configure('group1', background='#1e3a5f',
+                                     foreground='#ffffff',
+                                     font=('Segoe UI', GRP_FONT_SIZE, 'bold'))
+            self.tree.tag_configure('group2', background='#2a4a2a',
+                                     foreground='#ffffff',
+                                     font=('Segoe UI', GRP_FONT_SIZE, 'italic'))
+            self.tree.tag_configure('group3', background='#5f4a1e',
+                                     foreground='#ffffff',
+                                     font=('Segoe UI', GRP_FONT_SIZE))
         else:
             bg = '#f0f0f0'; panel = '#ffffff'
-            self.tree.tag_configure('group1', background='#E3F2FD')
-            self.tree.tag_configure('group2', background='#F1F8E9')
-            self.tree.tag_configure('group3', background='#FFF8E1')
+            self.tree.tag_configure('group1', background='#E3F2FD',
+                                     font=('Segoe UI', GRP_FONT_SIZE, 'bold'))
+            self.tree.tag_configure('group2', background='#F1F8E9',
+                                     font=('Segoe UI', GRP_FONT_SIZE, 'italic'))
+            self.tree.tag_configure('group3', background='#FFF8E1',
+                                     font=('Segoe UI', GRP_FONT_SIZE))
 
         for w in [self.root, self.top, self.flt]:
             try: w.configure(bg=bg)
             except Exception: pass
         style = ttk.Style()
         style.theme_use('default')
-        style.configure('Treeview', rowheight=26, font=('Segoe UI', 9), background=panel)
+        style.configure('Treeview', rowheight=30, font=('Segoe UI', 9), background=panel)
         style.configure('Treeview.Heading', font=('Segoe UI', 9, 'bold'))
 
     def toggle_theme(self):
@@ -939,28 +1035,39 @@ class AssetManager:
             return
         dlg = tk.Toplevel(self.root)
         dlg.title("Массовое изменение")
-        dlg.geometry("420x220")
+        dlg.geometry("440x260")
         dlg.grab_set()
-        tk.Label(dlg, text=f"Выбрано: {len(selected)}",
+        tk.Label(dlg, text=f"Выбрано активов: {len(selected)}",
                  font=('Segoe UI', 11, 'bold')).pack(pady=8)
-        tk.Label(dlg, text="Поле:").pack(anchor='w', padx=20)
-        field_var = tk.StringVar(value='account')
+        tk.Label(dlg, text="Что изменить:", bg='#f0f0f0',
+                 font=('Segoe UI', 10)).pack(anchor='w', padx=20)
+        field_var = tk.StringVar(value='Ответственный')
         ttk.Combobox(dlg, textvariable=field_var, state='readonly', width=30,
-                     values=['account', 'responsible', 'location']).pack(padx=20)
-        tk.Label(dlg, text="Новое значение:").pack(anchor='w', padx=20, pady=(8, 0))
+                     values=list(FIELD_LABELS.keys())).pack(padx=20, pady=4)
+        tk.Label(dlg, text="Новое значение:", bg='#f0f0f0',
+                 font=('Segoe UI', 10)).pack(anchor='w', padx=20, pady=(8, 0))
         value_var = tk.StringVar()
-        tk.Entry(dlg, textvariable=value_var, width=35).pack(padx=20)
+        tk.Entry(dlg, textvariable=value_var, width=40,
+                 font=('Segoe UI', 10)).pack(padx=20, pady=4)
 
         def do():
             if not value_var.get().strip():
+                messagebox.showwarning("Внимание", "Введите новое значение")
                 return
-            field = field_var.get()
+            ru_field = field_var.get()
+            en_field = FIELD_LABELS.get(ru_field)
+            if not en_field:
+                return
+            new_val = value_var.get().strip()
             for a in selected:
-                a[field] = value_var.get().strip()
+                a[en_field] = new_val
             self.save_file()
-            self.log_action('MASS_EDIT', f"{len(selected)} × {field} = {value_var.get()}")
+            self.log_action('MASS_EDIT',
+                            f"{len(selected)} × {ru_field} = {new_val}")
             self.refresh()
             dlg.destroy()
+            messagebox.showinfo("Готово",
+                f"Изменено активов: {len(selected)}\n{ru_field} → {new_val}")
 
         ttk.Button(dlg, text="Применить", command=do).pack(pady=12)
 
@@ -1259,8 +1366,9 @@ class AssetManager:
 
         active = len([a for a in data if not a.get('disposal_date')])
         disposed = len(data) - active
-        axes[1, 1].pie([active, disposed], labels=['Активные', 'Выбывшие'],
-                       autopct='%1.1f%%', colors=['#4CAF50', '#F44336'])
+        if active or disposed:
+            axes[1, 1].pie([active, disposed], labels=['Активные', 'Выбывшие'],
+                           autopct='%1.1f%%', colors=['#4CAF50', '#F44336'])
         axes[1, 1].set_title('Статус')
 
         plt.tight_layout()
@@ -1374,7 +1482,7 @@ class AssetManager:
         self.root.after(ms, self.do_autosave)
 
     def do_autosave(self):
-        if self.current_file:
+        if self.current_file and not self.current_file.lower().endswith('.xls'):
             self.save_file()
             self.autosave_label.config(
                 text=f"✓ Сохранено в {datetime.now().strftime('%H:%M:%S')}")
